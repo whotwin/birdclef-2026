@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.pth
+*.pt
+# Virtual environments
+.venv
+train_audio/
+train_soundscapes/
+*.csv
+华文楷体.ttf
+*.ogg
+*.png
