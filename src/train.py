@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
 from src.data.dataset import SoundscapeDataset, TrainAudioDataset, load_species_columns
@@ -44,10 +45,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def calculate_metrics(model, loader, criterion, device):
     model.eval()
     total_loss = 0
     n_batches = 0
+    all_labels = []
+    all_probs = []
 
     for specs, labels, _ in loader:
         specs = specs.to(device)
@@ -56,8 +59,24 @@ def evaluate(model, loader, criterion, device):
         loss = criterion(logits, labels)
         total_loss += loss.item()
         n_batches += 1
+        all_labels.append(labels.cpu())
+        all_probs.append(torch.sigmoid(logits).cpu())
 
-    return total_loss / n_batches
+    all_labels = torch.cat(all_labels).numpy()
+    all_probs = torch.cat(all_probs).numpy()
+
+    # Macro ROC-AUC: per-class AUC, averaged
+    aucs = []
+    for i in range(all_labels.shape[1]):
+        if len(np.unique(all_labels[:, i])) > 1:
+            try:
+                auc = roc_auc_score(all_labels[:, i], all_probs[:, i])
+                aucs.append(auc)
+            except ValueError:
+                pass
+    macro_auc = np.mean(aucs) if aucs else 0.0
+
+    return total_loss / n_batches, macro_auc
 
 
 def main():
@@ -134,7 +153,7 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Training loop
-    best_val_loss = float("inf")
+    best_val_auc = 0.0
     checkpoint_dir = PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(exist_ok=True)
 
@@ -145,12 +164,12 @@ def main():
         t0 = time.time()
 
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
-        val_loss = evaluate(model, val_loader, criterion, device)
+        val_loss, val_auc = calculate_metrics(model, val_loader, criterion, device)
 
         scheduler.step()
 
         elapsed = time.time() - t0
-        print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Time: {elapsed:.0f}s")
+        print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Time: {elapsed:.0f}s")
 
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
@@ -164,23 +183,24 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "train_loss": train_loss,
                 "val_loss": val_loss,
+                "val_auc": val_auc,
                 "args": vars(args),
             },
             ckpt_path,
         )
         print(f"  Saved: {ckpt_path}")
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             best_path = checkpoint_dir / "best.pt"
             torch.save(model.state_dict(), best_path)
-            print(f"  New best! Saved to {best_path}")
+            print(f"  New best AUC! Saved to {best_path}")
 
     # Save training history
     with open(checkpoint_dir / "history.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+    print(f"\nTraining complete. Best val AUC: {best_val_auc:.4f}")
     print(f"Checkpoints saved in: {checkpoint_dir}")
 
 
