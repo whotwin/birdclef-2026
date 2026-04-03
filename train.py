@@ -242,7 +242,7 @@ if __name__ == "__main__":
         train_data = train_df[train_df['fold'] != fold].copy()
         if CFG['pos_weight']:
             pos_weight = compute_pos_weight(train_data, submission_df).to(CFG['device'])
-            pos_weight = torch.clamp(pos_weight, max=20)
+            pos_weight = torch.clamp(pos_weight, max=5)
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
             criterion = nn.BCEWithLogitsLoss()
