@@ -6,6 +6,37 @@ import torch
 import random
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+
+
+def spec_augment(spec, p=0.5, num_freq_masks=2, num_time_masks=2,
+                 freq_mask_param=15, time_mask_param=35):
+    """SpecAugment: 随机频带遮挡 + 时间遮挡"""
+    if random.random() > p:
+        return spec
+
+    spec = spec.clone()
+    freq_bins, time_steps = spec.shape[-2], spec.shape[-1]
+
+    for _ in range(num_freq_masks):
+        f = random.randint(0, freq_mask_param)
+        f0 = random.randint(0, max(0, freq_bins - f))
+        spec[..., f0:f0+f, :] = 0
+
+    for _ in range(num_time_masks):
+        t = random.randint(0, time_mask_param)
+        t0 = random.randint(0, max(0, time_steps - t))
+        spec[..., t0:t0+t] = 0
+
+    return spec
+
+
+def time_shift_augment(spec, max_shift_pct=0.1):
+    """随机时间偏移"""
+    if random.random() > 0.5:
+        return spec
+    shift = int(spec.shape[-1] * random.uniform(-max_shift_pct, max_shift_pct))
+    return torch.roll(spec, shifts=shift, dims=-1)
 
 def hms_to_seconds(hms_str):
     """将 '00:00:20' 转换为 20.0"""
@@ -146,7 +177,12 @@ class BirdDataset(Dataset):
         # --- 5. 转换为 Tensor ---
         spec_t = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)
 
-        # --- 6. 处理多标签 (适应分号分隔的 birds) ---
+        # --- 6. 训练时应用增强 ---
+        if self.is_train:
+            spec_t = spec_augment(spec_t)
+            spec_t = time_shift_augment(spec_t)
+
+        # --- 7. 处理多标签 (适应分号分隔的 birds) ---
         label = torch.zeros(len(self.all_species))
         # 优先读 label_list (之前 load_bird_data 处理好的)，如果没有则读 primary_label
         birds = row.get('label_list', [row['primary_label']])

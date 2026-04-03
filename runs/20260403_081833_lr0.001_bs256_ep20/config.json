@@ -1,0 +1,8 @@
+{
+  "lr": 0.001,
+  "batch_size": 256,
+  "epochs": 20,
+  "n_folds": 3,
+  "backbone": "resnet34",
+  "device": "cuda"
+}
