@@ -1,0 +1,5 @@
+--2026-03-17 02:57:01--  https://storage.googleapis.com/kaggle-competitions-data/kaggle-v2/129329/15996945/bundle/archive.zip?GoogleAccessId=web-data@kaggle-161607.iam.gserviceaccount.com
+Connecting to 10.25.119.52:7890... connected.
+Proxy request sent, awaiting response... 403 Forbidden
+2026-03-17 02:57:02 ERROR 403: Forbidden.
+
