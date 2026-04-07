@@ -9,6 +9,7 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import os
+import yaml
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -18,6 +19,13 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import WeightedRandomSampler
+
+
+def load_config(config_path):
+    """从 YAML 文件加载训练配置"""
+    with open(config_path, 'r') as f:
+        cfg = yaml.safe_load(f)
+    return cfg
 
 
 class Logger:
@@ -45,7 +53,7 @@ class Logger:
             f.write(f"{key}: {value}\n")
 
 
-def setup_run(CFG):
+def setup_run(CFG, config_src=None):
     """自动创建本次运行的输出目录，返回 run_dir 路径"""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag = f"lr{CFG['lr']}_bs{CFG['batch_size']}_ep{CFG['epochs']}"
@@ -53,8 +61,13 @@ def setup_run(CFG):
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "checkpoints").mkdir(exist_ok=True)
 
+    # 保存当前使用的配置
     with open(run_dir / "config.json", "w") as f:
         json.dump(CFG, f, indent=2, default=str)
+    # 同时保存原始 yaml 文件
+    if config_src and Path(config_src).exists():
+        import shutil
+        shutil.copy(config_src, run_dir / "config.yaml")
 
     return run_dir
 
@@ -428,27 +441,13 @@ def main_worker(rank, world_size, train_df, submission_df, CFG, run_dir):
 
 
 if __name__ == "__main__":
-    CFG = {
-        'lr': 1e-3,
-        'batch_size': 256,
-        'epochs': 40,
-        'n_folds': 5,
-        'pos_weight': False,
-        'backbone': 'efficientnet_b0',
-        'multi_gpu': False,          # 是否启用多卡训练
-        'device_ids': [0],           # 使用的 GPU ID 列表
-        # 课程学习
-        'curriculum_warmup_epochs': 5,       # warmup 阶段（无增强）
-        'curriculum_K_start': 1,             # warmup 后 K 起始值
-        'curriculum_K_end': 4,              # 最终 K 值
-        'curriculum_scale_start': 0.0,      # warmup 后混叠音量上限起始
-        'curriculum_scale_end': 0.8,        # 最终混叠音量上限
-        'curriculum_noise_start': 0.0,      # warmup 噪声
-        'curriculum_noise_end': 0.005,      # 最终噪声
-    }
+    # --- 加载配置 ---
+    config_path = Path(__file__).parent / "config.yaml"
+    CFG = load_config(config_path)
+    CFG['lr'] = float(CFG['lr'])  # 确保 lr 是 float
 
     # --- 自动创建输出目录 ---
-    run_dir = setup_run(CFG)
+    run_dir = setup_run(CFG, config_src=config_path)
     log = Logger(run_dir)
     log.info(f"Run dir: {run_dir}")
 

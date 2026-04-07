@@ -1,0 +1,29 @@
+# 训练配置文件
+# 运行训练时会自动复制到 run_dir 目录下
+
+# 优化器
+lr: 0.001
+batch_size: 256
+
+# 训练循环
+epochs: 40
+n_folds: 5
+
+# 模型
+backbone: efficientnet_b0
+
+# 损失函数
+pos_weight: false  # 是否使用 pos_weight 加权
+
+# 多卡训练
+multi_gpu: false
+device_ids: [0]
+
+# 课程学习
+curriculum_warmup_epochs: 5
+curriculum_K_start: 1
+curriculum_K_end: 4
+curriculum_scale_start: 0.0
+curriculum_scale_end: 0.8
+curriculum_noise_start: 0.0
+curriculum_noise_end: 0.005
