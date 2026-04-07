@@ -141,49 +141,53 @@ class BirdDataset(Dataset):
         随机采样 K 条音频，混合叠加为一条，标签取 OR。
         返回: (spec [1, 128, T], label [num_classes])
         """
-        # 检查当前样本是否本身已含多标签（来自 soundscapes），若是则跳过混叠和噪声
-        row0 = self.df.iloc[idx]
-        birds0 = row0.get('label_list', [row0['primary_label']])
-        already_multi = len(birds0) > 1
+        try:
+            # 检查当前样本是否本身已含多标签（来自 soundscapes），若是则跳过混叠和噪声
+            row0 = self.df.iloc[idx]
+            birds0 = row0.get('label_list', [row0['primary_label']])
+            already_multi = len(birds0) > 1
 
-        K = self.mix_K
-        mix_scale = self.mix_scale if not already_multi else 0.0
-        noise_std = self.noise_std if not already_multi else 0.0
+            K = self.mix_K
+            mix_scale = self.mix_scale if not already_multi else 0.0
+            noise_std = self.noise_std if not already_multi else 0.0
 
-        # 采样 K 个索引（包含当前 idx）
-        indices = [idx] + [random.randint(0, len(self.df) - 1) for _ in range(K - 1)]
-        rows = [self.df.iloc[i] for i in indices]
+            # 采样 K 个索引（包含当前 idx）
+            indices = [idx] + [random.randint(0, len(self.df) - 1) for _ in range(K - 1)]
+            rows = [self.df.iloc[i] for i in indices]
 
-        # 加载并混合波形：主音频(idx) + 其他音频按 [0, mix_scale] 缩放后叠加
-        main_audio = self._load_audio(rows[0])
-        mixed = main_audio.copy()
-        for r in rows[1:]:
-            scale = random.uniform(0, mix_scale)
-            other_audio = self._load_audio(r)
-            mixed = mixed + other_audio * scale
+            # 加载并混合波形：主音频(idx) + 其他音频按 [0, mix_scale] 缩放后叠加
+            main_audio = self._load_audio(rows[0])
+            mixed = main_audio.copy()
+            for r in rows[1:]:
+                scale = random.uniform(0, mix_scale)
+                other_audio = self._load_audio(r)
+                mixed = mixed + other_audio * scale
 
-        # 叠加后归一化，防止 clipping
-        mix_weight = 1.0 + mix_scale * (K - 1)
-        mixed = mixed / max(mix_weight, 1e-6)
+            # 叠加后归一化，防止 clipping
+            mix_weight = 1.0 + mix_scale * (K - 1)
+            mixed = mixed / max(mix_weight, 1e-6)
 
-        # 添加白噪声
-        if noise_std > 0:
-            mixed = mixed + np.random.randn(*mixed.shape).astype(np.float32) * noise_std
+            # 添加白噪声
+            if noise_std > 0:
+                mixed = mixed + np.random.randn(*mixed.shape).astype(np.float32) * noise_std
 
-        # 混合标签 = OR
-        labels = np.stack([self._get_label(r) for r in rows])
-        combined_label = np.any(labels > 0, axis=0).astype(np.float32)
+            # 混合标签 = OR
+            labels = np.stack([self._get_label(r) for r in rows])
+            combined_label = np.any(labels > 0, axis=0).astype(np.float32)
 
-        # 提取 Mel 频谱图
-        spec = librosa.feature.melspectrogram(
-            y=mixed, sr=self.sr, n_mels=128, fmin=20, fmax=16000
-        )
-        spec = librosa.power_to_db(spec, ref=np.max)
-        spec = (spec - spec.min()) / (spec.max() - spec.min() + 1e-6)
-        spec_t = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)   # [1, 128, T]
-        label_t = torch.tensor(combined_label, dtype=torch.float32)     # [num_classes]
+            # 提取 Mel 频谱图
+            spec = librosa.feature.melspectrogram(
+                y=mixed, sr=self.sr, n_mels=128, fmin=20, fmax=16000
+            )
+            spec = librosa.power_to_db(spec, ref=np.max)
+            spec = (spec - spec.min()) / (spec.max() - spec.min() + 1e-6)
+            spec_t = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)   # [1, 128, T]
+            label_t = torch.tensor(combined_label, dtype=torch.float32)     # [num_classes]
 
-        return spec_t, label_t
+            return spec_t, label_t
+        except Exception as e:
+            print(f"[ERROR] Dataset error at idx={idx}: {e}")
+            raise
 
 if __name__ == "__main__":
     DATA_DIR = "./"

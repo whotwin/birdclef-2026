@@ -21,9 +21,7 @@ device_ids: [0]
 
 # 课程学习
 curriculum_warmup_epochs: 5
-curriculum_K_start: 1
 curriculum_K_end: 4
-curriculum_scale_start: 0.0
+curriculum_segments: 3          # 阶段数，K 从 2 变化到 curriculum_K_end，分 3 段
 curriculum_scale_end: 0.8
-curriculum_noise_start: 0.0
 curriculum_noise_end: 0.005

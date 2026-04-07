@@ -131,15 +131,18 @@ def prepare_cv_folds(df, n_splits=5):
 # ---- 多卡训练辅助函数 ----
 
 def setup_distributed():
-    """初始化 DDP 环境，从环境变量读取 local_rank"""
+    """初始化 DDP 环境"""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
     torch.cuda.set_device(local_rank)
     return local_rank
 
 
 def cleanup_distributed():
     """清理 DDP 环境"""
-    pass  # torchrun 自动管理，无需手动清理
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def get_device(local_rank, multi_gpu, device_ids):
@@ -238,6 +241,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, multi_g
 @torch.no_grad()
 def validate_one_epoch(model, loader, criterion, device, multi_gpu=False):
     model.eval()
+    running_loss = 0.0
     all_preds = []
     all_labels = []
 
@@ -250,25 +254,36 @@ def validate_one_epoch(model, loader, criterion, device, multi_gpu=False):
         outputs = model(images)
         loss = criterion(outputs, labels)
 
+        running_loss += loss.item()
         all_preds.append(torch.sigmoid(outputs).cpu().numpy())
         all_labels.append(labels.cpu().numpy())
 
+    n_batches = len(loader)
+    val_loss = running_loss / n_batches
+
     all_preds = np.vstack(all_preds)
     all_labels = np.vstack(all_labels)
-    val_loss = 0.0  # simplified; metrics are computed separately
 
-    # 多卡模式：汇总所有卡的预测和标签到 rank 0
+    # 多卡模式：汇总所有卡的 loss、预测和标签到 rank 0
     if multi_gpu:
+        tensor_loss = torch.tensor(val_loss, device=device)
         preds_tensor = torch.tensor(all_preds, dtype=torch.float32, device=device)
         labels_tensor = torch.tensor(all_labels, dtype=torch.float32, device=device)
+
+        dist.all_reduce(tensor_loss, op=dist.ReduceOp.SUM)
+        tensor_loss = tensor_loss / dist.get_world_size()
+
         gathered_preds = [torch.zeros_like(preds_tensor) for _ in range(dist.get_world_size())]
         gathered_labels = [torch.zeros_like(labels_tensor) for _ in range(dist.get_world_size())]
         dist.all_gather(gathered_preds, preds_tensor)
         dist.all_gather(gathered_labels, labels_tensor)
+
         if dist.get_rank() == 0:
+            val_loss = tensor_loss.item()
             all_preds = np.vstack([p.cpu().numpy() for p in gathered_preds])
             all_labels = np.vstack([l.cpu().numpy() for l in gathered_labels])
         else:
+            val_loss = tensor_loss.item()
             all_preds = None
             all_labels = None
 
@@ -281,16 +296,24 @@ def get_curriculum_params(epoch, CFG):
     """根据当前 epoch 返回 BirdDataset 的课程学习参数"""
     warmup = CFG['curriculum_warmup_epochs']
     total = CFG['epochs']
+    max_K = CFG['curriculum_K_end']
+    max_scale = CFG['curriculum_scale_end']
+    max_noise = CFG['curriculum_noise_end']
+    segments = CFG.get('curriculum_segments', max_K - 1)  # 阶段数，默认 max_K-1
 
     if epoch < warmup:
         return {'mix_K': 1, 'mix_scale': 0.0, 'noise_std': 0.0}
 
-    progress = (epoch - warmup) / max(total - warmup - 1, 1)
-    progress = min(progress, 1.0)
+    # 将剩余 epoch 均分为 segments 段，每段一种 K 值
+    remaining = total - warmup
+    step = remaining / segments
+    segment = min(int((epoch - warmup) / step), segments - 1)
+    K = segment + 2   # K = 2 ~ (segments + 1)，不超过 max_K
 
-    K = int(CFG['curriculum_K_start'] + (CFG['curriculum_K_end'] - CFG['curriculum_K_start']) * progress)
-    scale = CFG['curriculum_scale_start'] + (CFG['curriculum_scale_end'] - CFG['curriculum_scale_start']) * progress
-    noise = CFG['curriculum_noise_start'] + (CFG['curriculum_noise_end'] - CFG['curriculum_noise_start']) * progress
+    # scale 和 noise 与 K 线性相关（K=2 时最小，K=max_K 时最大）
+    ratio = (K - 1) / (max_K - 1)
+    scale = max_scale * ratio
+    noise = max_noise * ratio
 
     return {'mix_K': K, 'mix_scale': scale, 'noise_std': noise}
 
@@ -315,13 +338,16 @@ def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1
         criterion = nn.BCEWithLogitsLoss()
 
     model = BirdClassifier(model_name=CFG['backbone'], num_classes=234).to(device)
+    print(f"[Rank {rank}] Model loaded, device={next(model.parameters()).device}", flush=True)
 
     if multi_gpu:
         model = DDP(model, device_ids=[rank])
+        print(f"[Rank {rank}] DDP wrapped", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=CFG['lr'], weight_decay=1e-4)
     scaler = GradScaler()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG['epochs'])
+    print(f"[Rank {rank}] Optimizer & scheduler ready", flush=True)
 
     fold_ckpt_dir = run_dir / "checkpoints" / f"fold{fold}"
     fold_ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -329,6 +355,8 @@ def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1
     best_val_auc = 0.0
     best_preds = None
     best_targets = None
+
+    print(f"[Rank {rank}] Starting epoch loop...", flush=True)
 
     for epoch in range(CFG['epochs']):
         # 获取当前 epoch 的课程学习参数并重建 train DataLoader
@@ -439,6 +467,8 @@ def main_worker(rank, world_size, train_df, submission_df, CFG, run_dir):
 
 
 if __name__ == "__main__":
+    import sys
+    sys.stderr = sys.stdout  # 确保错误输出不缓冲
     # --- 加载配置 ---
     config_path = Path(__file__).parent / "config.yaml"
     CFG = load_config(config_path)
