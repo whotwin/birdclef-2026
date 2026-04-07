@@ -11,7 +11,6 @@ import pandas as pd
 import os
 import yaml
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from model import BirdClassifier
 from datasets import BirdDataset, load_bird_data, hms_to_seconds
@@ -134,14 +133,13 @@ def prepare_cv_folds(df, n_splits=5):
 def setup_distributed():
     """初始化 DDP 环境，从环境变量读取 local_rank"""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    dist.init_process_group(backend="nccl")
     torch.cuda.set_device(local_rank)
     return local_rank
 
 
 def cleanup_distributed():
     """清理 DDP 环境"""
-    dist.destroy_process_group()
+    pass  # torchrun 自动管理，无需手动清理
 
 
 def get_device(local_rank, multi_gpu, device_ids):
@@ -444,12 +442,10 @@ if __name__ == "__main__":
     # --- 加载配置 ---
     config_path = Path(__file__).parent / "config.yaml"
     CFG = load_config(config_path)
-    CFG['lr'] = float(CFG['lr'])  # 确保 lr 是 float
+    CFG['lr'] = float(CFG['lr'])
 
     # --- 自动创建输出目录 ---
     run_dir = setup_run(CFG, config_src=config_path)
-    log = Logger(run_dir)
-    log.info(f"Run dir: {run_dir}")
 
     # --- 准备数据 ---
     DATA_DIR = "./"
@@ -465,19 +461,18 @@ if __name__ == "__main__":
     train_df = pd.concat([selected_df, soundscapes_df], axis=0, ignore_index=True)
     train_df = prepare_cv_folds(train_df, n_splits=CFG['n_folds'])
 
-    # --- 启动训练 ---
-    multi_gpu = CFG['multi_gpu']
-    device_ids = CFG['device_ids']
+    # --- 判断启动方式 ---
+    # torchrun 设置 RANK 环境变量，自动管理分布式进程
+    is_torchrun = os.environ.get("RANK") is not None
+    multi_gpu = CFG['multi_gpu'] and is_torchrun
+    rank = int(os.environ.get("RANK", 0)) if is_torchrun else 0
+    world_size = int(os.environ.get("WORLD_SIZE", 1)) if is_torchrun else 1
+    CFG['multi_gpu'] = multi_gpu
 
-    if multi_gpu:
-        world_size = len(device_ids)
-        log.info(f"Starting multi-GPU training on {world_size} GPUs: {device_ids}")
-        mp.spawn(
-            main_worker,
-            args=(world_size, train_df, submission_df, CFG, run_dir),
-            nprocs=world_size,
-            join=True,
-        )
-    else:
-        log.info(f"Starting single-GPU training on device: cuda:{device_ids[0]}")
-        main_worker(rank=0, world_size=1, train_df=train_df, submission_df=submission_df, CFG=CFG, run_dir=run_dir)
+    log = Logger(run_dir) if rank == 0 else None
+    if rank == 0:
+        log.info(f"Run dir: {run_dir}")
+        log.info(f"Config: multi_gpu={multi_gpu}, is_torchrun={is_torchrun}")
+
+    main_worker(rank=rank, world_size=world_size, train_df=train_df,
+                submission_df=submission_df, CFG=CFG, run_dir=run_dir)

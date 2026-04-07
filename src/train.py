@@ -44,9 +44,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
 
 
 @torch.no_grad()
+@torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss = 0
+    total_loss = 0.0
     n_batches = 0
 
     for specs, labels, _ in loader:
@@ -54,9 +55,12 @@ def evaluate(model, loader, criterion, device):
         labels = labels.to(device)
         logits = model(specs)
         loss = criterion(logits, labels)
+        print(f"  [DEBUG] batch loss: {loss.item():.6f}, logits range: [{logits.min():.2f}, {logits.max():.2f}]")
         total_loss += loss.item()
         n_batches += 1
 
+    if n_batches == 0:
+        raise RuntimeError("Validation DataLoader returned 0 batches — check dataset and num_workers")
     return total_loss / n_batches
 
 
