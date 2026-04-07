@@ -1,0 +1,4 @@
+fold0_best_auc: 0.9447
+fold1_best_auc: 0.9502
+fold2_best_auc: 0.9428
+oof_macro_auc: 0.9383

@@ -11,10 +11,10 @@ wheels/
 .venv
 train_audio/
 train_soundscapes/
-runs/
 *.csv
 华文楷体.ttf
 *.ogg
 *.png
 *.log
 *.bundle
+*.npz
