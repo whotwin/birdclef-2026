@@ -141,7 +141,8 @@ def get_device(local_rank, multi_gpu, device_ids):
 
 # ---- 数据加载器 ----
 
-def get_loaders_for_fold(df, fold, submission_df, batch_size, multi_gpu=False, world_size=1, rank=0):
+def get_loaders_for_fold(df, fold, submission_df, batch_size, multi_gpu=False, world_size=1, rank=0,
+                         mix_K=1, mix_scale=0.0, noise_std=0.0):
     """
     根据 fold 编号获取对应的训练和验证 DataLoader
     multi_gpu=True 时使用 DistributedSampler 替代 WeightedRandomSampler
@@ -150,8 +151,9 @@ def get_loaders_for_fold(df, fold, submission_df, batch_size, multi_gpu=False, w
     train_data = df[df['fold'] != fold].copy()
     valid_data = df[df['fold'] == fold].copy()
 
-    # 实例化 Dataset
-    train_ds = BirdDataset(train_data[['filepath', 'primary_label']], submission_df)
+    # 实例化 Dataset，传入课程学习参数
+    train_ds = BirdDataset(train_data[['filepath', 'primary_label']], submission_df,
+                           mix_K=mix_K, mix_scale=mix_scale, noise_std=noise_std)
     valid_ds = BirdDataset(valid_data[['filepath', 'primary_label']], submission_df)
 
     if multi_gpu:
@@ -262,6 +264,26 @@ def validate_one_epoch(model, loader, criterion, device, multi_gpu=False):
     return val_loss, all_preds, all_labels
 
 
+# ---- 课程学习参数调度 ----
+
+def get_curriculum_params(epoch, CFG):
+    """根据当前 epoch 返回 BirdDataset 的课程学习参数"""
+    warmup = CFG['curriculum_warmup_epochs']
+    total = CFG['epochs']
+
+    if epoch < warmup:
+        return {'mix_K': 1, 'mix_scale': 0.0, 'noise_std': 0.0}
+
+    progress = (epoch - warmup) / max(total - warmup - 1, 1)
+    progress = min(progress, 1.0)
+
+    K = int(CFG['curriculum_K_start'] + (CFG['curriculum_K_end'] - CFG['curriculum_K_start']) * progress)
+    scale = CFG['curriculum_scale_start'] + (CFG['curriculum_scale_end'] - CFG['curriculum_scale_start']) * progress
+    noise = CFG['curriculum_noise_start'] + (CFG['curriculum_noise_end'] - CFG['curriculum_noise_start']) * progress
+
+    return {'mix_K': K, 'mix_scale': scale, 'noise_std': noise}
+
+
 # ---- 单 Fold 训练（供 DDP spawn 调用） ----
 
 def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1):
@@ -272,12 +294,6 @@ def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1
 
     log = Logger(run_dir)
     log.info(f"[Rank {rank}] Fold {fold} starting on device {device}")
-
-    train_loader, val_loader = get_loaders_for_fold(
-        train_df, fold, submission_df,
-        batch_size=CFG['batch_size'],
-        multi_gpu=multi_gpu, world_size=world_size, rank=rank
-    )
 
     train_data = train_df[train_df['fold'] != fold].copy()
     if CFG['pos_weight']:
@@ -299,15 +315,26 @@ def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1
     fold_ckpt_dir = run_dir / "checkpoints" / f"fold{fold}"
     fold_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info(f"[Rank {rank}] Fold {fold} | Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)}")
-
     best_val_auc = 0.0
     best_preds = None
     best_targets = None
 
     for epoch in range(CFG['epochs']):
+        # 获取当前 epoch 的课程学习参数并重建 train DataLoader
+        params = get_curriculum_params(epoch, CFG)
+        train_loader, val_loader = get_loaders_for_fold(
+            train_df, fold, submission_df,
+            batch_size=CFG['batch_size'],
+            multi_gpu=multi_gpu, world_size=world_size, rank=rank,
+            mix_K=params['mix_K'],
+            mix_scale=params['mix_scale'],
+            noise_std=params['noise_std'],
+        )
         if multi_gpu:
             train_loader.sampler.set_epoch(epoch)
+
+        if (not multi_gpu) or (rank == 0):
+            log.info(f"[Rank {rank}] Fold {fold} | Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)} | Curriculum: K={params['mix_K']}, scale={params['mix_scale']:.3f}, noise={params['noise_std']:.5f}")
 
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, scaler, multi_gpu=multi_gpu)
         val_loss, preds, targets = validate_one_epoch(model, val_loader, criterion, device, multi_gpu=multi_gpu)
@@ -316,7 +343,7 @@ def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1
         if (not multi_gpu) or (rank == 0):
             val_auc = calculate_metrics(targets, preds)
             scheduler.step()
-            log.info(f"  Epoch {epoch+1}/{CFG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f}")
+            log.info(f"  Epoch {epoch+1}/{CFG['epochs']} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Curriculum: K={params['mix_K']}, scale={params['mix_scale']:.3f}, noise={params['noise_std']:.5f}")
 
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
@@ -409,7 +436,15 @@ if __name__ == "__main__":
         'pos_weight': False,
         'backbone': 'efficientnet_b0',
         'multi_gpu': False,          # 是否启用多卡训练
-        'device_ids': [0],           # 使用的 GPU ID 列表，None = 自动检测所有 GPU
+        'device_ids': [0],           # 使用的 GPU ID 列表
+        # 课程学习
+        'curriculum_warmup_epochs': 5,       # warmup 阶段（无增强）
+        'curriculum_K_start': 1,             # warmup 后 K 起始值
+        'curriculum_K_end': 4,              # 最终 K 值
+        'curriculum_scale_start': 0.0,      # warmup 后混叠音量上限起始
+        'curriculum_scale_end': 0.8,        # 最终混叠音量上限
+        'curriculum_noise_start': 0.0,      # warmup 噪声
+        'curriculum_noise_end': 0.005,      # 最终噪声
     }
 
     # --- 自动创建输出目录 ---

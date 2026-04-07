@@ -66,19 +66,23 @@ def load_bird_data(base_path, audio_dir="train_audio", csv_name="train_metadata.
 
 class BirdDataset(Dataset):
     def __init__(self, df, submission_df, sr=32000, duration=5, is_train=True,
-                 mix_range=(1, 4)):
+                 mix_K=1, mix_scale=0.0, noise_std=0.0):
         """
         :param df: 包含 'filepath' 和 'primary_label' 列的 DataFrame
         :param submission_df: 包含提交格式的 DataFrame
         :param sr: 采样率 (BirdCLEF 常标配 32000)
         :param duration: 训练切片长度 (秒)
-        :param mix_range: 混合的音频段数范围 [min, max]，1 = 不混合
+        :param mix_K: 混叠音频数量（课程学习参数）
+        :param mix_scale: 混叠音量的最大 scale（其他音频 scale ∈ [0, mix_scale]，课程学习参数）
+        :param noise_std: 白噪声标准差（课程学习参数）
         """
         self.df = df.reset_index(drop=True)
         self.sr = sr
         self.duration = duration
         self.is_train = is_train
-        self.mix_range = mix_range
+        self.mix_K = mix_K
+        self.mix_scale = mix_scale
+        self.noise_std = noise_std
         self.target_length = sr * duration
 
         # 预先建立标签映射 (234 类)
@@ -137,27 +141,27 @@ class BirdDataset(Dataset):
         随机采样 K 条音频，混合叠加为一条，标签取 OR。
         返回: (spec [1, 128, T], label [num_classes])
         """
-        min_k, max_k = self.mix_range
-        K = random.randint(min_k, max_k)
+        K = self.mix_K
 
         # 采样 K 个索引（包含当前 idx）
         indices = [idx] + [random.randint(0, len(self.df) - 1) for _ in range(K - 1)]
         rows = [self.df.iloc[i] for i in indices]
 
-        # 加载并混合波形：主音频(idx) + 其他音频按 0.3~0.8 缩放后叠加
+        # 加载并混合波形：主音频(idx) + 其他音频按 [0, mix_scale] 缩放后叠加
         main_audio = self._load_audio(rows[0])
         mixed = main_audio.copy()
         for r in rows[1:]:
-            scale = random.uniform(0.3, 0.8)
+            scale = random.uniform(0, self.mix_scale)
             other_audio = self._load_audio(r)
             mixed = mixed + other_audio * scale
 
         # 叠加后归一化，防止 clipping
-        mixed = mixed / (1.0 + 0.8 * (K - 1))  # 近似归一化
+        mix_weight = 1.0 + self.mix_scale * (K - 1)
+        mixed = mixed / max(mix_weight, 1e-6)
 
-        # 添加轻微白噪声
-        noise_std = random.uniform(0.001, 0.005)
-        mixed = mixed + np.random.randn(*mixed.shape).astype(np.float32) * noise_std
+        # 添加白噪声
+        if self.noise_std > 0:
+            mixed = mixed + np.random.randn(*mixed.shape).astype(np.float32) * self.noise_std
 
         # 混合标签 = OR
         labels = np.stack([self._get_label(r) for r in rows])
