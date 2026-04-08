@@ -12,10 +12,10 @@ class ProjectionHead(nn.Module):
 
     def __init__(self, in_features, hidden_dim=512, out_features=128):
         super().__init__()
+        # Standard SimCLR projection head: Linear -> ReLU -> Linear (no BatchNorm)
         self.net = nn.Sequential(
             nn.Linear(in_features, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(hidden_dim, out_features),
         )
 

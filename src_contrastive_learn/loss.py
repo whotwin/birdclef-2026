@@ -37,9 +37,9 @@ class NTXentLoss(nn.Module):
         # Cosine similarity matrix
         sim = torch.mm(z, z.t()) / self.temperature  # [2N, 2N]
 
-        # Mask out self-similarity
+        # Mask out self-similarity (non-inplace to avoid autograd version conflicts)
         mask = torch.eye(2 * N, dtype=torch.bool, device=self.device)
-        sim.masked_fill_(mask, float('-inf'))
+        sim = sim.masked_fill(mask, float('-inf'))
 
         # Positive pairs: (i, i+N) and (i+N, i)
         labels = torch.cat([

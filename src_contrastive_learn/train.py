@@ -105,11 +105,12 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, scal
             z2 = model(view2)
             loss = criterion(z1, z2)
 
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
 
         if scheduler is not None:
             scheduler.step()
@@ -229,7 +230,7 @@ def train(cfg):
     ).to(device)
 
     if is_torchrun:
-        model = DDP(model, device_ids=[local_rank])
+        model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
 
     if rank == 0:
         log.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
@@ -245,7 +246,8 @@ def train(cfg):
     total_steps = len(loader) * cfg['training']['epochs']
     warmup_steps = len(loader) * cfg['training']['warmup_epochs']
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
-    scaler = GradScaler()
+    # Only use GradScaler for single GPU; DDP + GradScaler has version issues with inplace ops
+    scaler = GradScaler() if not is_torchrun else None
 
     # ── Training Loop ────────────────────────────────────────────────────────
     best_loss = float('inf')
