@@ -5,7 +5,21 @@ import librosa
 import torch
 import random
 import numpy as np
+import signal
+import warnings
 from torch.utils.data import Dataset, DataLoader
+
+
+class _AudioTimeout(Exception):
+    pass
+
+
+def _timeout_handler(signum, frame):
+    raise _AudioTimeout()
+
+
+# Wrap librosa calls with a 15-second timeout to prevent hangs on corrupted files.
+_AUDIO_TIMEOUT_SEC = 15
 
 def hms_to_seconds(hms_str):
     """将 '00:00:20' 转换为 20.0"""
@@ -93,30 +107,58 @@ class BirdDataset(Dataset):
         return len(self.df)
 
     def _load_audio(self, row):
-        """加载单条音频（pad/truncate 到固定长度），返回波形。"""
+        """加载单条音频（pad/truncate 到固定长度），返回波形。超时或异常时返回静音。"""
         path = row['filepath']
         has_valid_time = 'start' in row and not pd.isna(row['start']) and str(row['start']).strip() != ""
         if has_valid_time:
             offset = float(row['start'])
             read_duration = self.duration
+            total_duration = None
         else:
+            total_duration = None
             try:
+                old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+                signal.alarm(_AUDIO_TIMEOUT_SEC)
                 total_duration = librosa.get_duration(path=path)
-                if total_duration > self.duration:
-                    offset = random.uniform(0, total_duration - self.duration)
-                    read_duration = self.duration
-                else:
-                    offset = 0
-                    read_duration = total_duration
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except _AudioTimeout:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+                total_duration = None
             except Exception:
+                total_duration = None
+
+            if total_duration and total_duration > self.duration:
+                offset = random.uniform(0, total_duration - self.duration)
+                read_duration = self.duration
+            elif total_duration:
+                offset = 0
+                read_duration = total_duration
+            else:
                 offset = 0
                 read_duration = self.duration
 
+        audio = np.zeros(self.target_length, dtype=np.float32)
         try:
-            audio, _ = librosa.load(path, sr=self.sr, offset=offset, duration=read_duration, mono=True)
-        except Exception as e:
-            print(f"读取失败 {path}: {e}")
-            audio = np.zeros(self.target_length)
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(_AUDIO_TIMEOUT_SEC)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                audio_raw, _ = librosa.load(path, sr=self.sr, offset=offset, duration=read_duration, mono=True)
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+            audio = audio_raw.astype(np.float32)
+        except _AudioTimeout:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+        except Exception:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
+        # Guard against NaN/Inf from corrupted data
+        if not np.isfinite(audio).all():
+            audio = np.zeros(self.target_length, dtype=np.float32)
 
         # Pad/truncate
         if len(audio) < self.target_length:
@@ -141,53 +183,54 @@ class BirdDataset(Dataset):
         随机采样 K 条音频，混合叠加为一条，标签取 OR。
         返回: (spec [1, 128, T], label [num_classes])
         """
-        try:
-            # 检查当前样本是否本身已含多标签（来自 soundscapes），若是则跳过混叠和噪声
-            row0 = self.df.iloc[idx]
-            birds0 = row0.get('label_list', [row0['primary_label']])
-            already_multi = len(birds0) > 1
+        # 检查当前样本是否本身已含多标签（来自 soundscapes），若是则跳过混叠和噪声
+        row0 = self.df.iloc[idx]
+        birds0 = row0.get('label_list', [row0['primary_label']])
+        already_multi = len(birds0) > 1
 
-            K = self.mix_K
-            mix_scale = self.mix_scale if not already_multi else 0.0
-            noise_std = self.noise_std if not already_multi else 0.0
+        K = self.mix_K
+        mix_scale = self.mix_scale if not already_multi else 0.0
+        noise_std = self.noise_std if not already_multi else 0.0
 
-            # 采样 K 个索引（包含当前 idx）
-            indices = [idx] + [random.randint(0, len(self.df) - 1) for _ in range(K - 1)]
-            rows = [self.df.iloc[i] for i in indices]
+        # 采样 K 个索引（包含当前 idx）
+        indices = [idx] + [random.randint(0, len(self.df) - 1) for _ in range(K - 1)]
+        rows = [self.df.iloc[i] for i in indices]
 
-            # 加载并混合波形：主音频(idx) + 其他音频按 [0, mix_scale] 缩放后叠加
-            main_audio = self._load_audio(rows[0])
-            mixed = main_audio.copy()
-            for r in rows[1:]:
-                scale = random.uniform(0, mix_scale)
-                other_audio = self._load_audio(r)
-                mixed = mixed + other_audio * scale
+        # 加载并混合波形：主音频(idx) + 其他音频按 [0, mix_scale] 缩放后叠加
+        main_audio = self._load_audio(rows[0])
+        mixed = main_audio.copy()
+        for r in rows[1:]:
+            scale = random.uniform(0, mix_scale)
+            other_audio = self._load_audio(r)
+            mixed = mixed + other_audio * scale
 
-            # 叠加后归一化，防止 clipping
-            mix_weight = 1.0 + mix_scale * (K - 1)
-            mixed = mixed / max(mix_weight, 1e-6)
+        # 叠加后归一化，防止 clipping
+        mix_weight = 1.0 + mix_scale * (K - 1)
+        mixed = mixed / max(mix_weight, 1e-6)
 
-            # 添加白噪声
-            if noise_std > 0:
-                mixed = mixed + np.random.randn(*mixed.shape).astype(np.float32) * noise_std
+        # 添加白噪声
+        if noise_std > 0:
+            mixed = mixed + np.random.randn(*mixed.shape).astype(np.float32) * noise_std
 
-            # 混合标签 = OR
-            labels = np.stack([self._get_label(r) for r in rows])
-            combined_label = np.any(labels > 0, axis=0).astype(np.float32)
+        # 混合标签 = OR
+        labels = np.stack([self._get_label(r) for r in rows])
+        combined_label = np.any(labels > 0, axis=0).astype(np.float32)
 
-            # 提取 Mel 频谱图
-            spec = librosa.feature.melspectrogram(
-                y=mixed, sr=self.sr, n_mels=128, fmin=20, fmax=16000
-            )
-            spec = librosa.power_to_db(spec, ref=np.max)
-            spec = (spec - spec.min()) / (spec.max() - spec.min() + 1e-6)
-            spec_t = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)   # [1, 128, T]
-            label_t = torch.tensor(combined_label, dtype=torch.float32)     # [num_classes]
+        # 提取 Mel 频谱图
+        spec = librosa.feature.melspectrogram(
+            y=mixed, sr=self.sr, n_mels=128, fmin=20, fmax=16000
+        )
+        spec = librosa.power_to_db(spec, ref=np.max)
+        spec_min = spec.min()
+        spec_max = spec.max()
+        denom = spec_max - spec_min + 1e-6
+        spec = (spec - spec_min) / denom
+        if not np.isfinite(spec).all():
+            spec = np.zeros_like(spec)
+        spec_t = torch.tensor(spec, dtype=torch.float32).unsqueeze(0)   # [1, 128, T]
+        label_t = torch.tensor(combined_label, dtype=torch.float32)     # [num_classes]
 
-            return spec_t, label_t
-        except Exception as e:
-            print(f"[ERROR] Dataset error at idx={idx}: {e}")
-            raise
+        return spec_t, label_t
 
 if __name__ == "__main__":
     DATA_DIR = "./"
