@@ -69,7 +69,7 @@ def contrastive_collate_fn(batch):
     for v1, v2 in batch:
         view1_list.append(v1)
         view2_list.append(v2)
-    return torch.cat(view1_list, dim=0), torch.cat(view2_list, dim=0)
+    return torch.stack(view1_list, dim=0), torch.stack(view2_list, dim=0)
 
 
 def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, scaler, epoch, log):
@@ -149,6 +149,8 @@ def train(cfg):
         fmin=cfg['data']['fmin'],
         fmax=cfg['data']['fmax'],
         augmentation=aug,
+        soundscapes_dir=cfg['data'].get('soundscapes_dir'),
+        n_samples_per_soundscape=cfg['data'].get('n_samples_per_soundscape', 2),
     )
     loader = DataLoader(
         dataset,
@@ -174,7 +176,7 @@ def train(cfg):
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg['training']['lr'],
-        weight_decay=cfg['training']['weight_decay'],
+        weight_decay=float(cfg['training']['weight_decay']),
     )
 
     total_steps = len(loader) * cfg['training']['epochs']

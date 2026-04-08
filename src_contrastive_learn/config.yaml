@@ -9,6 +9,8 @@ data:
   n_mels: 128
   fmin: 20
   fmax: 16000
+  soundscapes_dir: "./train_soundscapes"
+  n_samples_per_soundscape: 2
 
 model:
   backbone: efficientnet_b0    # timm backbone
