@@ -1,5 +1,5 @@
 """
-SimCLR contrastive pretraining loop.
+SimCLR contrastive pretraining loop with multi-GPU (DDP) support.
 """
 import os
 import time
@@ -12,6 +12,9 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DistributedSampler
 from tqdm import tqdm
 
 from encoder import SimCLREncoder
@@ -25,6 +28,21 @@ def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def setup_distributed():
+    """Initialize DDP environment."""
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def cleanup_distributed():
+    """Clean up DDP environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 class Logger:
@@ -72,14 +90,14 @@ def contrastive_collate_fn(batch):
     return torch.stack(view1_list, dim=0), torch.stack(view2_list, dim=0)
 
 
-def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, scaler, epoch, log):
+def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, scaler, epoch, log, is_ddp=False, world_size=1):
     model.train()
     total_loss = 0.0
     pbar = tqdm(loader, desc=f"Epoch {epoch+1}")
 
     for view1, view2 in pbar:
-        view1 = view1.to(device)
-        view2 = view2.to(device)
+        view1 = view1.to(device, non_blocking=True)
+        view2 = view2.to(device, non_blocking=True)
 
         optimizer.zero_grad()
         with autocast(device_type=device.type):
@@ -99,18 +117,25 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, scal
         total_loss += loss.item()
         pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{optimizer.param_groups[0]['lr']:.6f}")
 
-    return total_loss / len(loader)
+    avg_loss = total_loss / len(loader)
+
+    if is_ddp:
+        tensor_loss = torch.tensor(avg_loss, device=device)
+        dist.all_reduce(tensor_loss, op=dist.ReduceOp.SUM)
+        avg_loss = tensor_loss.item() / world_size
+
+    return avg_loss
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, is_ddp=False, world_size=1):
     """Validate contrastive loss on a subset."""
     model.eval()
     total_loss = 0.0
     count = 0
     for view1, view2 in loader:
-        view1 = view1.to(device)
-        view2 = view2.to(device)
+        view1 = view1.to(device, non_blocking=True)
+        view2 = view2.to(device, non_blocking=True)
         z1 = model(view1)
         z2 = model(view2)
         loss = criterion(z1, z2)
@@ -118,17 +143,37 @@ def validate(model, loader, criterion, device):
         count += 1
         if count >= 100:  # quick eval on subset
             break
-    return total_loss / count
+    avg_loss = total_loss / count
+    if is_ddp:
+        tensor_loss = torch.tensor(avg_loss, device=device)
+        dist.all_reduce(tensor_loss, op=dist.ReduceOp.SUM)
+        avg_loss = tensor_loss.item() / world_size
+    return avg_loss
 
 
 def train(cfg):
-    device = torch.device(cfg['training']['device'] if torch.cuda.is_available() else 'cpu')
+    # Detect DDP / single GPU mode
+    is_torchrun = os.environ.get("RANK") is not None
+    rank = int(os.environ.get("RANK", 0)) if is_torchrun else 0
+    world_size = int(os.environ.get("WORLD_SIZE", 1)) if is_torchrun else 1
+
+    if is_torchrun:
+        local_rank = setup_distributed()
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device(cfg['training']['device'] if torch.cuda.is_available() else 'cpu')
+
     set_seed(cfg['training']['seed'])
 
     run_dir = setup_run(cfg['output']['run_dir'], f"simclr_{cfg['model']['backbone']}")
-    log = Logger(Path(run_dir))
-    log.info(f"Run dir: {run_dir}")
-    log.info(f"Config: {json.dumps(cfg, indent=2, default=str)}")
+
+    # Only rank 0 writes logs / saves checkpoints
+    if rank == 0:
+        log = Logger(Path(run_dir))
+        log.info(f"Run dir: {run_dir}")
+        log.info(f"Config: {json.dumps(cfg, indent=2, default=str)}")
+    else:
+        log = None
 
     # ── Augmentation ──────────────────────────────────────────────────────────
     aug = get_contrastive_augmentation(
@@ -152,16 +197,29 @@ def train(cfg):
         soundscapes_dir=cfg['data'].get('soundscapes_dir'),
         n_samples_per_soundscape=cfg['data'].get('n_samples_per_soundscape', 2),
     )
+
+    num_workers = cfg['training'].get('num_workers', 4)
+
+    if is_torchrun:
+        sampler = DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True
+        )
+    else:
+        sampler = None
+
     loader = DataLoader(
         dataset,
         batch_size=cfg['training']['batch_size'],
-        shuffle=True,
-        num_workers=4,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=num_workers,
         pin_memory=True,
         collate_fn=contrastive_collate_fn,
         drop_last=True,
     )
-    log.info(f"Dataset size: {len(dataset)}, Batches: {len(loader)}")
+    if rank == 0:
+        log.info(f"Dataset size: {len(dataset)}, Batches: {len(loader)}, Workers: {num_workers}")
 
     # ── Model ───────────────────────────────────────────────────────────────
     model = SimCLREncoder(
@@ -169,7 +227,12 @@ def train(cfg):
         projection_dim=cfg['model']['projection_dim'],
         pretrained=cfg['model']['pretrained'],
     ).to(device)
-    log.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+    if is_torchrun:
+        model = DDP(model, device_ids=[local_rank])
+
+    if rank == 0:
+        log.info(f"Model: {sum(p.numel() for p in model.parameters()):,} parameters")
 
     # ── Loss, Optimizer, Scheduler ──────────────────────────────────────────
     criterion = NTXentLoss(temperature=cfg['training']['temperature'], device=device)
@@ -187,35 +250,46 @@ def train(cfg):
     # ── Training Loop ────────────────────────────────────────────────────────
     best_loss = float('inf')
     for epoch in range(cfg['training']['epochs']):
+        if is_torchrun:
+            loader.sampler.set_epoch(epoch)
+
         train_loss = train_one_epoch(
-            model, loader, optimizer, scheduler, criterion, device, scaler, epoch, log
+            model, loader, optimizer, scheduler, criterion, device, scaler,
+            epoch, log, is_ddp=is_torchrun, world_size=world_size
         )
-        log.info(f"Epoch {epoch+1}/{cfg['training']['epochs']} | Loss: {train_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Save checkpoint
-        if (epoch + 1) % cfg['output']['save_every'] == 0 or epoch == cfg['training']['epochs'] - 1:
-            ckpt_path = os.path.join(run_dir, "checkpoints", f"epoch_{epoch+1}.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': train_loss,
-                'cfg': cfg,
-            }, ckpt_path)
-            log.info(f"  Saved: {ckpt_path}")
+        if rank == 0:
+            log.info(f"Epoch {epoch+1}/{cfg['training']['epochs']} | Loss: {train_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Save best
-        if train_loss < best_loss:
-            best_loss = train_loss
-            ckpt_path = os.path.join(run_dir, "checkpoints", "best.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'train_loss': train_loss,
-                'cfg': cfg,
-            }, ckpt_path)
-            log.info(f"  New best loss: {best_loss:.4f} -> saved best.pt")
+            # Save checkpoint
+            if (epoch + 1) % cfg['output']['save_every'] == 0 or epoch == cfg['training']['epochs'] - 1:
+                ckpt_path = os.path.join(run_dir, "checkpoints", f"epoch_{epoch+1}.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'train_loss': train_loss,
+                    'cfg': cfg,
+                }, ckpt_path)
+                log.info(f"  Saved: {ckpt_path}")
 
-    log.info(f"Training complete. Best loss: {best_loss:.4f}")
-    log.info(f"Run dir: {run_dir}")
+            # Save best
+            if train_loss < best_loss:
+                best_loss = train_loss
+                ckpt_path = os.path.join(run_dir, "checkpoints", "best.pt")
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.module.state_dict(),
+                    'train_loss': train_loss,
+                    'cfg': cfg,
+                }, ckpt_path)
+                log.info(f"  New best loss: {best_loss:.4f} -> saved best.pt")
+
+    if rank == 0:
+        log.info(f"Training complete. Best loss: {best_loss:.4f}")
+        log.info(f"Run dir: {run_dir}")
+
+    if is_torchrun:
+        cleanup_distributed()
+
     return run_dir

@@ -63,9 +63,9 @@ class ContrastiveAudioDataset(Dataset):
         self.audio_dir = audio_dir
         self.sr = sr
         self.duration = duration
-        self.n_mels = n_mels
-        self.fmin = fmin
-        self.fmax = fmax
+        self.n_mels = int(n_mels)
+        self.fmin = int(fmin)
+        self.fmax = int(fmax)
         self.target_length = sr * duration
         self.augmentation = augmentation
         self.max_offset = max_offset

@@ -27,6 +27,7 @@ training:
   scheduler: cosine            # cosine or step
   device: cuda
   seed: 42
+  num_workers: 4             # DataLoader num_workers
 
 augmentation:
   # Audio-level noise (white/pink/brown, randomly chosen)
