@@ -132,13 +132,11 @@ def train(cfg):
 
     # ── Augmentation ──────────────────────────────────────────────────────────
     aug = get_contrastive_augmentation(
-        freq_mask_param=cfg['augmentation']['freq_mask_param'],
-        time_mask_param=cfg['augmentation']['time_mask_param'],
-        n_freq_mask=cfg['augmentation']['n_freq_mask'],
-        n_time_mask=cfg['augmentation']['n_time_mask'],
-        volume_jitter=cfg['augmentation']['volume_jitter'],
         noise_std=cfg['augmentation']['noise_std'],
-        time_crop_ratio=cfg['augmentation']['time_crop_jitter'],
+        volume_jitter=cfg['augmentation']['volume_jitter'],
+        speed_range=cfg['augmentation'].get('speed_range', [0.8, 1.2]),
+        n_silent_cuts=cfg['augmentation'].get('n_silent_cuts', 2),
+        max_cut_ratio=cfg['augmentation'].get('max_cut_ratio', 0.05),
     )
 
     # ── Dataset ─────────────────────────────────────────────────────────────

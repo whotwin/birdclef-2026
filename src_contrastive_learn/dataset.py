@@ -29,7 +29,7 @@ class ContrastiveAudioDataset(Dataset):
             sr: sample rate
             duration: clip duration in seconds
             n_mels, fmin, fmax: mel spectrogram params
-            augmentation: callable that takes spec [1, n_mels, T] and returns augmented spec
+            augmentation: callable that takes audio np.ndarray [target_length] and returns augmented audio
             max_offset: max random offset to try (for long files, limit to save time)
         """
         self.df = pd.read_csv(csv_path)
@@ -111,10 +111,11 @@ class ContrastiveAudioDataset(Dataset):
 
         # Load audio once
         audio = self._load_audio(filepath)
-        base_spec = self._audio_to_spec(audio)  # [1, n_mels, T]
 
-        # Apply two independent random augmentations
-        view1 = self.augmentation(base_spec)
-        view2 = self.augmentation(base_spec)
+        # Apply two independent audio-level augmentations, then convert to spec
+        view1_audio = self.augmentation(audio.copy())
+        view2_audio = self.augmentation(audio.copy())
+        view1 = self._audio_to_spec(view1_audio)
+        view2 = self._audio_to_spec(view2_audio)
 
         return view1, view2

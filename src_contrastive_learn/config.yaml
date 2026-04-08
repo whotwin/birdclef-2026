@@ -27,17 +27,15 @@ training:
   seed: 42
 
 augmentation:
-  # SpecAugment params
-  freq_mask_param: 20         # max freq bands to mask
-  time_mask_param: 40         # max time frames to mask
-  n_freq_mask: 2              # number of freq masks
-  n_time_mask: 2              # number of time masks
-  # Volume
-  volume_jitter: 0.2          # max volume scale [1-volume_jitter, 1+volume_jitter]
-  # Noise
-  noise_std: 0.005            # additive white noise std
-  # Time crop jitter
-  time_crop_jitter: 0.1       # random crop ratio [0, time_crop_jitter]
+  # Audio-level noise (white/pink/brown, randomly chosen)
+  noise_std: 0.005            # max noise std
+  # Volume jitter
+  volume_jitter: 0.2          # scale range ±20%
+  # Speed change via time-stretch
+  speed_range: [0.8, 1.2]     # random speed factor range
+  # Random silent cuts
+  n_silent_cuts: 2            # number of silent segments to cut
+  max_cut_ratio: 0.05         # max cut length as fraction of total
 
 linear_eval:
   epochs: 30

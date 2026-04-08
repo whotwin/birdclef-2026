@@ -1,132 +1,149 @@
 """
-Spectrogram augmentations for contrastive learning.
-All augmentations operate on mel spectrograms [1, n_mels, T].
+Audio-level augmentations for contrastive learning.
+All augmentations operate on raw audio waveforms [target_length].
 """
 import random
 import numpy as np
-import torch
+import librosa
 
 
-class SpecAugment:
-    """SpecAugment: randomly mask frequency and time bands."""
+class MultiNoise:
+    """Add white, pink, or brown noise (randomly chosen per call)."""
 
-    def __init__(self, freq_mask_param=20, time_mask_param=40,
-                 n_freq_mask=2, n_time_mask=2, p=0.5):
-        self.freq_mask_param = freq_mask_param
-        self.time_mask_param = time_mask_param
-        self.n_freq_mask = n_freq_mask
-        self.n_time_mask = n_time_mask
-        self.p = p
+    def __init__(self, noise_std=0.005):
+        self.noise_std = noise_std
 
-    def __call__(self, spec):
+    def __call__(self, audio):
         """
         Args:
-            spec: Tensor [1, n_mels, T]
+            audio: np.ndarray [target_length], float32
         Returns:
-            Augmented tensor [1, n_mels, T]
+            np.ndarray [target_length], float32
         """
-        if random.random() > self.p:
-            return spec
+        noise_type = random.choice(['white', 'pink', 'brown'])
+        n = len(audio)
 
-        n_mels, T = spec.shape[1], spec.shape[2]
-        spec = spec.clone()
+        if noise_type == 'white':
+            noise = np.random.randn(n).astype(np.float32) * self.noise_std
+        elif noise_type == 'pink':
+            # Pink noise via successive integration of white noise
+            white = np.random.randn(n).astype(np.float32)
+            noise = np.cumsum(white).astype(np.float32)
+            noise = noise - noise[0]  # zero-mean
+            std = np.std(noise)
+            if std > 1e-6:
+                noise = noise / std * self.noise_std
+            else:
+                noise = np.zeros(n, dtype=np.float32)
+        else:  # brown
+            white = np.random.randn(n).astype(np.float32)
+            noise = np.cumsum(white).astype(np.float32)
+            # Apply leaky integration to keep bounded
+            noise = noise - 0.998 * np.roll(noise, 1)
+            noise[0] = 0
+            std = np.std(noise)
+            if std > 1e-6:
+                noise = noise / std * self.noise_std
+            else:
+                noise = np.zeros(n, dtype=np.float32)
 
-        # Frequency masking
-        for _ in range(self.n_freq_mask):
-            f = random.randint(0, min(self.freq_mask_param, n_mels - 1))
-            f0 = random.randint(0, n_mels - f)
-            spec[:, f0:f0 + f, :] = 0
-
-        # Time masking
-        for _ in range(self.n_time_mask):
-            t = random.randint(0, min(self.time_mask_param, T - 1))
-            t0 = random.randint(0, T - t)
-            spec[:, :, t0:t0 + t] = 0
-
-        return spec
-
-
-class TimeCrop:
-    """Random time-domain crop with padding."""
-
-    def __init__(self, crop_ratio=0.1, pad_value=0.0):
-        self.crop_ratio = crop_ratio
-        self.pad_value = pad_value
-
-    def __call__(self, spec):
-        """
-        Args:
-            spec: Tensor [1, n_mels, T]
-        Returns:
-            Cropped and padded tensor [1, n_mels, T]
-        """
-        _, n_mels, T = spec.shape
-        crop_size = int(T * (1.0 - self.crop_ratio))
-        if crop_size >= T:
-            return spec
-
-        start = random.randint(0, T - crop_size)
-        cropped = spec[:, :, start:start + crop_size]
-
-        # Pad back to original length
-        pad_left = start
-        pad_right = T - (start + crop_size)
-        return torch.nn.functional.pad(cropped, (pad_left, pad_right), value=self.pad_value)
+        return (audio + noise).astype(np.float32)
 
 
 class VolumeJitter:
-    """Random volume scaling."""
+    """Random volume scaling on audio waveform."""
 
     def __init__(self, jitter_range=0.2):
         self.jitter_range = jitter_range
 
-    def __call__(self, spec):
+    def __call__(self, audio):
+        """
+        Args:
+            audio: np.ndarray [target_length], float32
+        Returns:
+            np.ndarray [target_length], float32
+        """
         scale = 1.0 + random.uniform(-self.jitter_range, self.jitter_range)
-        return spec * scale
+        return (audio * scale).astype(np.float32)
 
 
-class GaussianNoise:
-    """Add Gaussian noise."""
+class SpeedChange:
+    """Change audio speed via time-stretch (resampling)."""
 
-    def __init__(self, std=0.005):
-        self.std = std
+    def __init__(self, speed_range=(0.8, 1.2)):
+        self.speed_range = speed_range
 
-    def __call__(self, spec):
-        noise = torch.randn_like(spec) * self.std
-        return spec + noise
+    def __call__(self, audio):
+        """
+        Args:
+            audio: np.ndarray [target_length], float32
+        Returns:
+            np.ndarray [target_length], float32 (resampled back to original length)
+        """
+        speed = random.uniform(*self.speed_range)
+        # time_stretch returns audio at different length
+        stretched = librosa.effects.time_stretch(audio, rate=speed)
+
+        # Resample back to original target length via linear interpolation
+        target_len = len(audio)
+        if len(stretched) == target_len:
+            return stretched.astype(np.float32)
+        indices = np.linspace(0, len(stretched) - 1, target_len)
+        resampled = np.interp(indices, np.arange(len(stretched)), stretched).astype(np.float32)
+        return resampled
+
+
+class RandomSilentCut:
+    """Randomly cut out silent segments in the audio."""
+
+    def __init__(self, n_cuts=2, max_cut_ratio=0.05):
+        self.n_cuts = n_cuts
+        self.max_cut_ratio = max_cut_ratio
+
+    def __call__(self, audio):
+        """
+        Args:
+            audio: np.ndarray [target_length], float32
+        Returns:
+            np.ndarray [target_length], float32
+        """
+        n = len(audio)
+        result = audio.copy()
+
+        for _ in range(self.n_cuts):
+            max_cut_len = int(n * self.max_cut_ratio)
+            if max_cut_len < 1:
+                continue
+            cut_len = random.randint(1, max_cut_len)
+            start = random.randint(0, n - cut_len)
+            result[start:start + cut_len] = 0.0
+
+        return result.astype(np.float32)
 
 
 class Compose:
-    """Compose multiple augmentations."""
+    """Compose multiple audio augmentations."""
 
     def __init__(self, transforms):
         self.transforms = transforms
 
-    def __call__(self, spec):
+    def __call__(self, audio):
         for t in self.transforms:
-            spec = t(spec)
-        return spec
+            audio = t(audio)
+        return audio
 
 
 def get_contrastive_augmentation(
-    freq_mask_param=20,
-    time_mask_param=40,
-    n_freq_mask=2,
-    n_time_mask=2,
-    volume_jitter=0.2,
     noise_std=0.005,
-    time_crop_ratio=0.1,
+    volume_jitter=0.2,
+    speed_range=(0.8, 1.2),
+    n_silent_cuts=2,
+    max_cut_ratio=0.05,
 ):
-    """Build the standard contrastive augmentation pipeline."""
+    """Build the audio-level contrastive augmentation pipeline."""
     return Compose([
-        TimeCrop(crop_ratio=time_crop_ratio),
-        SpecAugment(
-            freq_mask_param=freq_mask_param,
-            time_mask_param=time_mask_param,
-            n_freq_mask=n_freq_mask,
-            n_time_mask=n_time_mask,
-            p=0.5,
-        ),
+        MultiNoise(noise_std=noise_std),
         VolumeJitter(jitter_range=volume_jitter),
-        GaussianNoise(std=noise_std),
+        SpeedChange(speed_range=speed_range),
+        RandomSilentCut(n_cuts=n_silent_cuts, max_cut_ratio=max_cut_ratio),
     ])
