@@ -111,6 +111,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, criterion, device, scal
             scaler.update()
         else:
             loss.backward()
+            optimizer.step()
 
         if scheduler is not None:
             scheduler.step()
