@@ -337,7 +337,13 @@ def train_fold(fold, train_df, submission_df, CFG, run_dir, rank=0, world_size=1
     else:
         criterion = nn.BCEWithLogitsLoss()
 
-    model = BirdClassifier(model_name=CFG['backbone'], num_classes=234).to(device)
+    pretrained_ckpt = CFG.get('pretrained_ckpt')
+    use_timm_pretrained = pretrained_ckpt is None
+    model = BirdClassifier(
+        model_name=CFG['backbone'], num_classes=234,
+        pretrained=use_timm_pretrained,
+        pretrained_ckpt=pretrained_ckpt,
+    ).to(device)
     print(f"[Rank {rank}] Model loaded, device={next(model.parameters()).device}", flush=True)
 
     if multi_gpu:

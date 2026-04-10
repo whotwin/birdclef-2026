@@ -2,27 +2,49 @@ import torch
 import torch.nn as nn
 import timm
 class BirdClassifier(nn.Module):
-    def __init__(self, model_name='efficientnet_b0', num_classes=234, pretrained=True):
+    def __init__(self, model_name='efficientnet_b0', num_classes=234, pretrained=True, pretrained_ckpt=None):
         super(BirdClassifier, self).__init__()
-        
+
         # 直接使用 timm 创建骨干网络
         # in_chans=1: 自动将原本接收 RGB(3) 的第一层改为接收单通道(1)
         # num_classes=0: 移除原有的分类头，方便我们自定义
+        # pretrained=False when loading custom ckpt to avoid double-loading
         self.backbone = timm.create_model(
-            model_name, 
-            pretrained=pretrained, 
-            in_chans=1, 
-            num_classes=0, 
+            model_name,
+            pretrained=(pretrained and pretrained_ckpt is None),
+            in_chans=1,
+            num_classes=0,
             global_pool='' # 留空以便后续自定义池化
         )
-        
+
         # 获取骨干网络输出的特征维度
         # EfficientNet-B0 通常是 1280, ResNet34 是 512
         num_features = self.backbone.num_features
-        
+
         # 自定义池化层：结合平均池化和最大池化（竞赛常用技巧）
         self.global_pool = nn.AdaptiveAvgPool2d(1)
-        
+
+        # 从 SimCLR checkpoint 加载预训练 backbone 权重
+        if pretrained_ckpt is not None:
+            ckpt = torch.load(pretrained_ckpt, map_location='cpu', weights_only=False)
+            state_dict = ckpt['model_state_dict']
+
+            # 过滤出 backbone 权重（去掉投影头和 global_pool）
+            backbone_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('backbone.'):
+                    # 去掉 'backbone.' 前缀以匹配 timm 模型 key
+                    new_key = k[len('backbone.'):]
+                    backbone_state_dict[new_key] = v
+
+            # 加载 backbone 权重
+            incompatible = self.backbone.load_state_dict(backbone_state_dict, strict=False)
+            if incompatible.missing_keys:
+                print(f"[BirdClassifier] Loaded {len(backbone_state_dict)} backbone keys from {pretrained_ckpt}")
+                print(f"  Missing keys (not in ckpt): {incompatible.missing_keys}")
+            if incompatible.unexpected_keys:
+                print(f"  Unexpected keys (ignored): {incompatible.unexpected_keys}")
+
         # 分类头：Dropout -> Linear
         self.classifier = nn.Sequential(
             nn.Flatten(),
