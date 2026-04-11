@@ -32,18 +32,23 @@ class BirdClassifier(nn.Module):
             # 过滤出 backbone 权重（去掉投影头和 global_pool）
             backbone_state_dict = {}
             for k, v in state_dict.items():
-                if k.startswith('backbone.'):
-                    # 去掉 'backbone.' 前缀以匹配 timm 模型 key
+                if k.startswith('module.backbone.'):
+                    # DDP checkpoint: 'module.backbone.xxx' -> timm key 'xxx'
+                    new_key = k[len('module.backbone.'):]
+                    backbone_state_dict[new_key] = v
+                elif k.startswith('backbone.'):
+                    # 非 DDP checkpoint: 'backbone.xxx' -> timm key 'xxx'
                     new_key = k[len('backbone.'):]
                     backbone_state_dict[new_key] = v
 
             # 加载 backbone 权重
             incompatible = self.backbone.load_state_dict(backbone_state_dict, strict=False)
-            if incompatible.missing_keys:
+            if incompatible.missing_keys or incompatible.unexpected_keys:
                 print(f"[BirdClassifier] Loaded {len(backbone_state_dict)} backbone keys from {pretrained_ckpt}")
-                print(f"  Missing keys (not in ckpt): {incompatible.missing_keys}")
-            if incompatible.unexpected_keys:
-                print(f"  Unexpected keys (ignored): {incompatible.unexpected_keys}")
+                print(f"  Missing: {incompatible.missing_keys}")
+                print(f"  Unexpected (ignored): {incompatible.unexpected_keys}")
+            else:
+                print(f"[BirdClassifier] Successfully loaded {len(backbone_state_dict)} keys from {pretrained_ckpt}")
 
         # 分类头：Dropout -> Linear
         self.classifier = nn.Sequential(

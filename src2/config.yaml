@@ -11,7 +11,7 @@ n_folds: 5
 
 # 模型
 backbone: efficientnet_b0
-pretrained_ckpt: null  # set to path like "../runs_contrastive/20260409_090724_simclr_efficientnet_b0/checkpoints/best.pt"
+pretrained_ckpt: "../runs_contrastive/20260409_090724_simclr_efficientnet_b0/checkpoints/best.pt"
 
 # 损失函数
 pos_weight: false  # 是否使用 pos_weight 加权
