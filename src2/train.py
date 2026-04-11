@@ -299,21 +299,21 @@ def get_curriculum_params(epoch, CFG):
     max_K = CFG['curriculum_K_end']
     max_scale = CFG['curriculum_scale_end']
     max_noise = CFG['curriculum_noise_end']
-    segments = CFG.get('curriculum_segments', max_K - 1)  # 阶段数，默认 max_K-1
 
     if epoch < warmup:
         return {'mix_K': 1, 'mix_scale': 0.0, 'noise_std': 0.0}
 
-    # 将剩余 epoch 均分为 segments 段，每段一种 K 值
-    remaining = total - warmup
-    step = remaining / segments
-    segment = min(int((epoch - warmup) / step), segments - 1)
-    K = segment + 2   # K = 2 ~ (segments + 1)，不超过 max_K
+    # 进度比例：[0, 1]，从 warmup 结束时到训练结束
+    progress = (epoch - warmup) / (total - warmup)
+    progress = min(max(progress, 0.0), 1.0)
 
-    # scale 和 noise 与 K 线性相关（K=2 时最小，K=max_K 时最大）
-    ratio = (K - 1) / (max_K - 1)
-    scale = max_scale * ratio
-    noise = max_noise * ratio
+    # scale 在 [0.3, max_scale] 范围内随机选取
+    scale = np.random.uniform(0.3, max_scale)
+    # noise 在 [0, max_noise] 范围内随机选取
+    noise = np.random.uniform(0.0, max_noise)
+
+    # mix_K 阶梯式提升（必须是整数）
+    K = max(1, int(np.ceil(progress * (max_K - 1) + 1)))
 
     return {'mix_K': K, 'mix_scale': scale, 'noise_std': noise}
 
